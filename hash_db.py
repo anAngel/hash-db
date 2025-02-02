@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 from stat import S_ISLNK, S_ISREG
 from sys import stderr
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from scandir import walk
@@ -19,7 +20,6 @@ except ImportError:
 
 HASH_FILENAME = 'SHA512SUM'
 DB_FILENAME = 'hash_db.json'
-# fnmatch patterns, specifically:
 IMPORT_FILENAME_PATTERNS = [
     DB_FILENAME,
     HASH_FILENAME,
@@ -30,7 +30,6 @@ IMPORT_FILENAME_PATTERNS = [
     'DIGESTS.asc'
 ]
 HASH_FUNCTION = hashlib.sha512
-# Mostly used for importing from saved hash files
 EMPTY_FILE_HASH = ('cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce'
                    '47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e')
 SURROGATE_ESCAPES = re.compile(r'([\udc80-\udcff])')
@@ -41,8 +40,6 @@ REMOVED_COLOR = '\033[01;34m'
 MODIFIED_COLOR = '\033[01;31m'
 NO_COLOR = '\033[00m'
 
-# 1: 'version' field added
-# 2: entry 'type' field added; symlinks now treated correctly
 DATABASE_VERSION = 2
 
 def read_saved_hashes(hash_file: Path) -> dict:
@@ -65,10 +62,6 @@ def find_external_hash_files(path: Path):
                 yield dirpath / filename
 
 def find_hash_db_r(path: Path) -> Path:
-    """
-    Searches the given path and all of its parent
-    directories to find a filename matching DB_FILENAME
-    """
     abs_path = path.absolute()
     cur_path = abs_path / DB_FILENAME
     if cur_path.is_file():
@@ -85,10 +78,6 @@ def find_hash_db(path: Path):
     return hash_db_path
 
 def split_path(path: Path):
-    """
-    :param path: Filesystem path
-    :return: path pieces
-    """
     return path.parts[1:]
 
 class HashEntryType(Enum):
@@ -97,7 +86,6 @@ class HashEntryType(Enum):
 
 class HashEntry:
     def __init__(self, filename, size=None, mtime=None, hash=None, type=None):
-        # In memory, "filename" should be an absolute Path
         self.filename = filename
         self.size = size
         self.mtime = mtime
@@ -113,7 +101,6 @@ class HashEntry:
             else:
                 return EMPTY_FILE_HASH
         elif self.filename.is_symlink():
-            # The link target will suffice as the "contents"
             target = readlink(str(self.filename))
             return HASH_FUNCTION(fsencode(target)).hexdigest()
 
@@ -131,8 +118,6 @@ class HashEntry:
         if self.filename.is_symlink():
             self.type = HashEntryType.TYPE_SYMLINK
         else:
-            # Treat it as a file even if it's missing. This only occurs when
-            # importing from saved hashes.
             self.type = HashEntryType.TYPE_FILE
 
     def update(self):
@@ -162,8 +147,6 @@ def fix_symlinks(db):
             if entry.type == HashEntryType.TYPE_SYMLINK:
                 entry.update()
 
-# Intended usage: at version i, you need to run all
-# upgrade functions in range(i, DATABASE_VERSION)
 db_upgrades = [
     None,
     fix_symlinks,
@@ -226,13 +209,6 @@ class HashDatabase:
         self.version = DATABASE_VERSION
 
     def import_hashes(self, filename):
-        """
-        Imports a hash file created by e.g. sha512sum, and populates
-        the database with this data. Examines each file to obtain the
-        size and mtime information.
-
-        Returns the number of file hashes imported.
-        """
         hashes = read_saved_hashes(filename)
         i = 0
         for i, (file_path, hash) in enumerate(hashes.items(), 1):
@@ -242,23 +218,11 @@ class HashDatabase:
             try:
                 entry.update_attrs()
             except FileNotFoundError:
-                # Not much else to do here.
                 pass
             self.entries[entry.filename] = entry
         return i
 
     def _find_changes(self):
-        """
-        Walks the filesystem. Identifies noteworthy files -- those
-        that were added, removed, or changed (size, mtime or type).
-
-        Returns a 3-tuple of sets of HashEntry objects:
-        [0] added files
-        [1] removed files
-        [2] modified files
-
-        self.entries is not modified; this method only reports changes.
-        """
         added = set()
         modified = set()
         existing_files = set()
@@ -282,25 +246,20 @@ class HashDatabase:
         return added, removed, modified
 
     def update(self):
-        """
-        Walks the filesystem, adding and removing files from
-        the database as appropriate.
-
-        Returns a 3-tuple of sets of filenames:
-        [0] added files
-        [1] removed files
-        [2] modified files
-        """
         added, removed, modified = self._find_changes()
+        with ThreadPoolExecutor() as executor:
+            futures = {executor.submit(entry.update): entry for entry in added | modified}
+            for future in as_completed(futures):
+                entry = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"Exception while updating {entry.filename}: {exc}")
+
         for entry in added:
-            entry.update()
             self.entries[entry.filename] = entry
         for entry in removed:
             del self.entries[entry.filename]
-        # Entries will appear in 'modified' if the size, mtime or type
-        # change. I've seen a lot of spurious mtime mismatches on vfat
-        # filesystems (like on USB flash drives), so only report files
-        # as modified if the hash changes.
         content_modified = set()
         for entry in modified:
             old_hash = entry.hash
@@ -322,44 +281,32 @@ class HashDatabase:
         )
 
     def verify(self, verbose_failures=False):
-        """
-        Calls each HashEntry's verify method to make sure that
-        nothing has changed on disk.
-
-        Returns a 2-tuple of sets of filenames:
-        [0] modified files
-        [1] removed files
-        """
         modified = set()
         removed = set()
         count = len(self.entries)
-        # TODO: Track number of bytes hashed instead of number of files
-        # This will act as a more meaningful progress indicator
         i = 0
-        for i, entry in enumerate(self.entries.values(), 1):
-            if entry.exists():
-                if entry.verify():
-                    entry.update_attrs()
-                else:
+        with ThreadPoolExecutor() as executor:
+            futures = {executor.submit(entry.verify): entry for entry in self.entries.values()}
+            for future in as_completed(futures):
+                entry = futures[future]
+                try:
+                    if future.result():
+                        entry.update_attrs()
+                    else:
+                        if verbose_failures:
+                            stderr.write(f'\r{entry.filename} failed hash verification\n')
+                        modified.add(entry.filename)
+                except FileNotFoundError:
+                    removed.add(entry.filename)
                     if verbose_failures:
-                        stderr.write('\r{} failed hash verification\n'.format(entry.filename))
-                    modified.add(entry.filename)
-            else:
-                removed.add(entry.filename)
-                if verbose_failures:
-                    stderr.write('\r{} is missing\n'.format(entry.filename))
-            stderr.write('\rChecked {} of {} files'.format(i, count))
+                        stderr.write(f'\r{entry.filename} is missing\n')
+                i += 1
+                stderr.write(f'\rChecked {i} of {count} files')
         if i:
             stderr.write('\n')
         return modified, removed
 
     def export(self):
-        """
-        Exports the hash database in normal SHA512SUM format, usable as
-        input to `sha512sum -c`
-
-        Returns the number of entries exported.
-        """
         hash_filename = self.path / HASH_FILENAME
         i = 0
         with hash_filename.open('wb') as f:
